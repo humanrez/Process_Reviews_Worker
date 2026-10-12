@@ -17,6 +17,6 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")  # opsional, email sudah tidak dipakai
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "ptsatukliksaja@gmail.com")
 
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
-LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "15"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS") or "10")
+LLM_MODEL = os.environ.get("LLM_MODEL") or "claude-sonnet-4-6"
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE") or "15")

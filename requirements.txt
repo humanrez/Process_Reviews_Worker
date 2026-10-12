@@ -1,0 +1,11 @@
+supabase==2.9.1
+pandas==2.2.3
+openpyxl==3.1.5
+anthropic==0.40.0
+torch==2.5.1
+transformers==4.46.3
+bertopic==0.16.4
+sentence-transformers==3.3.1
+resend==2.5.1
+python-dotenv==1.0.1
+weasyprint==63.1

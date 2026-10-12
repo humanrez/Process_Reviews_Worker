@@ -11,6 +11,7 @@ Kumpulan fungsi untuk tiap tahap pemrosesan data:
 
 import io
 import json
+from html import escape as _esc
 import numpy as np
 import pandas as pd
 import torch
@@ -31,8 +32,19 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 def download_dataset(supabase, file_path: str) -> pd.DataFrame:
     file_bytes = supabase.storage.from_("datasets").download(file_path)
 
-    if file_path.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(file_bytes))
+    if file_path.lower().endswith(".csv"):
+        # CSV dari Excel/Windows sering bukan UTF-8. Coba beberapa encoding;
+        # utf-8-sig menangani BOM, cp1252 menangani file ANSI Windows.
+        df = None
+        last_error = None
+        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=None, engine="python")
+                break
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_error = e
+        if df is None:
+            raise ValueError(f"Encoding file CSV tidak dikenali: {last_error}")
     else:
         df = pd.read_excel(io.BytesIO(file_bytes))
 
@@ -61,6 +73,11 @@ def download_dataset(supabase, file_path: str) -> pd.DataFrame:
         print(f"[download_dataset] {rows_dropped} baris dibuang karena kurang dari 3 kata.")
 
     df = df.reset_index(drop=True)
+    if df.empty:
+        raise ValueError(
+            "Tidak ada baris yang bisa diproses setelah pembersihan "
+            "(kolom 'text' kosong atau semua baris kurang dari 3 kata)."
+        )
     return df
 
 
@@ -96,6 +113,7 @@ Data:
 
 def normalize_and_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     results = []
+    first_error = None
 
     for i in range(0, len(df), BATCH_SIZE):
         batch = df.iloc[i : i + BATCH_SIZE]
@@ -111,23 +129,32 @@ def normalize_and_sentiment(df: pd.DataFrame) -> pd.DataFrame:
             # Kalau satu batch gagal, jangan hentikan seluruh project —
             # catat baris mana yang gagal, biar bisa di-retry manual nanti.
             print(f"Batch {i} gagal: {e}")
+            if first_error is None:
+                first_error = e
             for item in items:
                 results.append(
                     {"id": item["id"], "normalized": None, "sentiment": None}
                 )
 
-    result_df = pd.DataFrame(results)
+    result_df = pd.DataFrame(results).reindex(columns=["id", "normalized", "sentiment"])
 
-    # PENTING: LLM kadang ikut mengembalikan field tambahan (misal 'text')
-    # meskipun tidak diminta di prompt. Kalau dibiarkan, ini bentrok dengan
-    # kolom 'text' asli saat merge (pandas otomatis rename jadi text_x/text_y).
-    # Jadi kita paksa cuma ambil kolom yang memang kita butuhkan.
-    result_df = result_df[["id", "normalized", "sentiment"]]
+    # Kalau SEMUA batch gagal (misal API key / nama model salah), hentikan
+    # project dengan pesan jelas, jangan lanjut menghasilkan report kosong.
+    if result_df["sentiment"].isna().all():
+        raise RuntimeError(f"Semua batch normalisasi/sentiment gagal. Error pertama: {first_error}")
 
-    result_df["id"] = result_df["id"].astype(df["id"].dtype)
+    # Rapikan output LLM: huruf kecil, dan nilai di luar 3 kategori jadi kosong.
+    result_df["sentiment"] = result_df["sentiment"].astype("string").str.strip().str.lower()
+    result_df.loc[~result_df["sentiment"].isin(["positive", "negative", "neutral"]), "sentiment"] = None
+    result_df["id"] = result_df["id"].astype(str)
+    result_df = result_df.drop_duplicates(subset="id").rename(columns={"id": "_key"})
 
-    df = df.merge(result_df, on="id", how="left")
+    # Merge lewat key string supaya tidak bergantung pada dtype kolom id asli.
+    df = df.copy()
+    df["_key"] = df["id"].astype(str)
+    df = df.merge(result_df, on="_key", how="left").drop(columns="_key")
     df = df.rename(columns={"normalized": "text_normalized"})
+    df["sentiment"] = df["sentiment"].astype(object).where(df["sentiment"].notna(), None)
 
     print(f"[normalize_and_sentiment] Kolom setelah merge: {list(df.columns)}")
     return df
@@ -228,11 +255,17 @@ def run_topic_modeling(df: pd.DataFrame) -> pd.DataFrame:
 
         docs = subset["text_normalized"].fillna(subset["text"]).tolist()
 
-        topic_model = BERTopic(
-            embedding_model=embedder,  # IndoBERT, dijalankan ulang tiap kelompok sentiment
-            min_topic_size=max(3, len(docs) // 20),  # adaptif ke jumlah data
-        )
-        topics, _ = topic_model.fit_transform(docs)
+        try:
+            topic_model = BERTopic(
+                embedding_model=embedder,  # IndoBERT, dijalankan ulang tiap kelompok sentiment
+                min_topic_size=max(3, len(docs) // 20),  # adaptif ke jumlah data
+            )
+            topics, _ = topic_model.fit_transform(docs)
+        except Exception as e:
+            # UMAP/HDBSCAN bisa error kalau dokumennya terlalu sedikit.
+            print(f"Topic modeling '{sentiment_value}' gagal ({len(docs)} dokumen): {e}")
+            df.loc[subset.index, "topic"] = "General"
+            continue
 
         # Ambil top keywords tiap cluster, lalu minta Claude buatkan judul topic
         topic_labels = {}
@@ -382,7 +415,7 @@ def _render_bar_rows_html(topic_counts: dict, accent_color: str, unit_label: str
         pct_width = round((count / max_count) * 100) if max_count else 0
         rows += f"""
         <div class="ov-bar-row">
-            <div class="ov-bar-label">{label}</div>
+            <div class="ov-bar-label">{_esc(str(label))}</div>
             <div class="ov-bar-track"><div class="ov-bar-fill" style="width:{pct_width}%; background:{accent_color};"></div></div>
             <div class="ov-bar-value">{count}</div>
         </div>"""
@@ -393,8 +426,8 @@ def _render_stat_card_html(headline_pct: int, headline_text: str, secondary_text
     return f"""
     <div class="stat-card">
         <div class="stat-pct">{headline_pct}%</div>
-        <p class="stat-headline">{headline_text}</p>
-        <p class="stat-secondary">{secondary_text}</p>
+        <p class="stat-headline">{_esc(headline_text)}</p>
+        <p class="stat-secondary">{_esc(secondary_text)}</p>
     </div>
     """
 
@@ -442,6 +475,19 @@ Kembalikan JSON dengan struktur persis seperti ini:
     except Exception as e:
         print(f"Gagal generate section content '{sentiment_value}': {e}")
         parsed = {"headline_text": "", "secondary_text": "", "topics": []}
+
+    if not isinstance(parsed, dict):
+        parsed = {"headline_text": "", "secondary_text": "", "topics": []}
+
+    # Susun daftar topik dari DATA (bukan dari LLM) supaya semua topik tetap
+    # tampil walau LLM gagal / salah menulis label.
+    llm_topics = {
+        t.get("topic_label"): t for t in parsed.get("topics", []) if isinstance(t, dict)
+    }
+    parsed["topics"] = [
+        llm_topics.get(label) or {"topic_label": label, "description": "", "recommendation": ""}
+        for label in topic_counts
+    ]
 
     parsed["headline_text"] = _clean_text(parsed.get("headline_text", ""))
     parsed["secondary_text"] = _clean_text(parsed.get("secondary_text", ""))
@@ -499,7 +545,7 @@ def _render_sentiment_pages(section_data: dict | None, sentiment_value: str, tot
     n_topics = len(section_data["topics"])
     for i, t in enumerate(section_data["topics"], start=1):
         quotes_html = "".join(
-            f'<div class="quote-card"><p>&ldquo;{q}&rdquo;</p></div>' for q in t["samples"]
+            f'<div class="quote-card"><p>&ldquo;{_esc(q)}&rdquo;</p></div>' for q in t["samples"]
         ) or '<div class="quote-card"><p>Tidak ada sampel data.</p></div>'
 
         detail_page = f"""
@@ -507,11 +553,11 @@ def _render_sentiment_pages(section_data: dict | None, sentiment_value: str, tot
             <div class="eyebrow" style="color:{theme['accent']};">{label.upper()} &middot; SUB KATEGORI {i} DARI {n_topics}</div>
             <div class="two-col">
                 <div class="col-left">
-                    <h1>{t['topic_label']}</h1>
+                    <h1>{_esc(str(t['topic_label']))}</h1>
                     <p class="big-number" style="color:{theme['accent']};">{t['count']}
                         <span class="big-number-suffix">feedback ({t['pct']}% dari {label.lower()})</span>
                     </p>
-                    <p>{t['description']}</p>
+                    <p>{_esc(t['description'])}</p>
                 </div>
                 <div class="col-right">
                     <div class="eyebrow" style="color:{theme['accent']};">SAMPEL FEEDBACK</div>
@@ -529,8 +575,8 @@ def _render_sentiment_pages(section_data: dict | None, sentiment_value: str, tot
         rec_cards += f"""
         <div class="rec-card">
             <div class="rec-priority" style="color:{theme['accent_dark']};">PRIORITAS {i} &middot; {t['count']} FEEDBACK</div>
-            <div class="rec-title">{t['topic_label']}</div>
-            <p>{t['recommendation']}</p>
+            <div class="rec-title">{_esc(str(t['topic_label']))}</div>
+            <p>{_esc(t['recommendation'])}</p>
         </div>
         """
     rec_page = f"""
@@ -628,7 +674,8 @@ def _render_full_sankey_svg(df: pd.DataFrame, height: int = 460) -> str:
         parts.append(f'<text x="{x1 + node_w / 2}" y="{mid_y:.1f}" font-size="13" fill="white" font-weight="bold" text-anchor="middle">{label} &middot; {count}</text>')
 
     # Level 2: per-sentiment -> sub kategori
-    for sent_key, (label, color, ry0, ry1, count) in zip(order, sent_nodes):
+    present_order = [s for s in order if sentiment_counts.get(s, 0) > 0]
+    for sent_key, (label, color, ry0, ry1, count) in zip(present_order, sent_nodes):
         sub = df[df["sentiment"] == sent_key]
         topic_counts = sub["topic"].value_counts().to_dict()
         topic_items = sorted(topic_counts.items(), key=lambda x: -x[1])
@@ -639,7 +686,7 @@ def _render_full_sankey_svg(df: pd.DataFrame, height: int = 460) -> str:
         parts.extend(level2_parts)
         for t_label, t_color, t_ry0, t_ry1, t_count in topic_nodes:
             mid_y = (t_ry0 + t_ry1) / 2 + 4
-            parts.append(f'<text x="{x2 + node_w + 8}" y="{mid_y:.1f}" font-size="12" fill="#333">{t_label} &middot; {t_count}</text>')
+            parts.append(f'<text x="{x2 + node_w + 8}" y="{mid_y:.1f}" font-size="12" fill="#333">{_esc(str(t_label))} &middot; {t_count}</text>')
 
     parts.append('</svg>')
     return "".join(parts)
@@ -802,7 +849,7 @@ NAV_SCRIPT = """
 """
 
 
-def generate_report(df: pd.DataFrame, project: dict) -> str:
+def generate_report(df: pd.DataFrame, project: dict) -> tuple[str, dict]:
     total = len(df)
     sentiment_counts = df["sentiment"].value_counts().to_dict()
 
@@ -823,14 +870,14 @@ def generate_report(df: pd.DataFrame, project: dict) -> str:
 
     cover_page = f"""
     <div class="page" style="background:#f7f5f0;">
-        <h1>{project['name']}</h1>
+        <h1>{_esc(str(project['name']))}</h1>
         <table class="meta">
             <tr><td>Tanggal Observasi Dimulai</td><td>{obs_start}</td></tr>
             <tr><td>Tanggal Observasi Selesai</td><td>{obs_end}</td></tr>
             <tr><td>Waktu Data Processing Dimulai</td><td>{proc_start}</td></tr>
             <tr><td>Waktu Data Processing Selesai</td><td>{proc_end}</td></tr>
             <tr><td>Jumlah Data</td><td>{total} feedback ({sentiment_counts.get('positive', 0)} positif &middot; {sentiment_counts.get('negative', 0)} negatif &middot; {sentiment_counts.get('neutral', 0)} netral)</td></tr>
-            <tr><td>Catatan</td><td>{catatan}</td></tr>
+            <tr><td>Catatan</td><td>{_esc(catatan)}</td></tr>
         </table>
         {_page_footer()}
     </div>
@@ -884,7 +931,7 @@ Kembalikan JSON: {{"kesimpulan": "1 paragraf (4-6 kalimat) yang merangkum temuan
         <h1>Kesimpulan</h1>
         <div class="two-col split-30-70">
             <div class="col-left">{gauge_html}<p style="margin-top:10px;font-weight:600;">Reputasi: {nss_data['reputasi']}</p></div>
-            <div class="col-right"><p>{kesimpulan_text}</p></div>
+            <div class="col-right"><p>{_esc(kesimpulan_text)}</p></div>
         </div>
         {_page_footer()}
     </div>
@@ -898,7 +945,7 @@ Kembalikan JSON: {{"kesimpulan": "1 paragraf (4-6 kalimat) yang merangkum temuan
 <html lang="id">
 <head>
 <meta charset="utf-8">
-<title>{project['name']}</title>
+<title>{_esc(str(project['name']))}</title>
 <style>{REPORT_CSS}</style>
 </head>
 <body>
@@ -972,7 +1019,7 @@ def upload_results(supabase, project: dict, df: pd.DataFrame, report_html: str, 
     project_id = project["id"]
 
     result_path = f"{user_id}/{project_id}/result.csv"
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     supabase.storage.from_("datasets").upload(
         result_path, csv_bytes, {"content-type": "text/csv; charset=utf-8", "upsert": "true"}
     )

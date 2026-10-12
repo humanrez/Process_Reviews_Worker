@@ -1,0 +1,63 @@
+name: worker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # cek project pending tiap 5 menit
+  workflow_dispatch: {}      # bisa dijalankan manual dari tab Actions
+
+concurrency:
+  group: worker
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      BATCH_SIZE: ${{ vars.BATCH_SIZE }}
+    steps:
+      - name: Cek ada project pending?
+        id: check
+        run: |
+          n=$(curl -s -G "$SUPABASE_URL/rest/v1/projects" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            --data-urlencode "select=id" --data-urlencode "status=eq.pending" \
+            | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+          echo "pending=$n"
+          echo "has_work=$([ "$n" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.has_work == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.has_work == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system libs (WeasyPrint)
+        if: steps.check.outputs.has_work == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b fonts-liberation
+
+      - name: Install Python deps
+        if: steps.check.outputs.has_work == 'true'
+        run: |
+          pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          grep -v '^torch==' requirements.txt > req-rest.txt
+          pip install -r req-rest.txt
+
+      - name: Cache model IndoBERT
+        if: steps.check.outputs.has_work == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-indobert-v1
+
+      - name: Run worker (once)
+        if: steps.check.outputs.has_work == 'true'
+        run: python worker.py --once

@@ -9,6 +9,8 @@ Kumpulan fungsi untuk tiap tahap pemrosesan data:
 5. upload_results          - simpan hasil balik ke Supabase Storage
 """
 
+import codecs
+import csv
 import io
 import json
 from html import escape as _esc
@@ -29,22 +31,61 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # ------------------------------------------------------------
 # 1. DOWNLOAD DATASET
 # ------------------------------------------------------------
+def _read_csv_bytes(file_bytes: bytes) -> pd.DataFrame:
+    """Baca CSV dengan encoding dan pemisah yang tidak diketahui."""
+    # 1) Decode: utf-16 hanya dicoba kalau ada BOM-nya, supaya file ANSI
+    #    tidak salah terbaca sebagai utf-16.
+    encodings = ["utf-8-sig"]
+    if file_bytes.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encodings = ["utf-16"]
+    encodings += ["cp1252", "latin-1"]
+    text, last_error = None, None
+    for enc in encodings:
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except UnicodeError as e:
+            last_error = e
+    if text is None:
+        raise ValueError(f"Encoding file CSV tidak dikenali: {last_error}")
+
+    # 2) Pemisah: pilih yang paling sering muncul di baris header.
+    #    (Tidak memakai sniffing otomatis, karena sering salah tebak.)
+    first_line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    sep = max([",", ";", chr(9)], key=first_line.count)
+    if first_line.count(sep) == 0:
+        sep = ","
+
+    # 3) Parse. Kalau ada baris yang kolomnya kelebihan (biasanya teks ulasan
+    #    mengandung pemisah tanpa tanda kutip), gabungkan kelebihannya kembali
+    #    ke kolom 'text' dan jangan gagalkan seluruh project.
+    try:
+        return pd.read_csv(io.StringIO(text), sep=sep)
+    except pd.errors.ParserError as e:
+        print(f"[download_dataset] CSV punya baris rusak, mencoba memulihkan: {e}")
+
+    rows = list(csv.reader(io.StringIO(text), delimiter=sep))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    header = rows[0]
+    n = len(header)
+    text_idx = header.index("text") if "text" in header else n - 1
+    fixed = []
+    for r in rows[1:]:
+        extra = len(r) - n
+        if extra > 0:
+            joined = sep.join(r[text_idx:text_idx + extra + 1])
+            r = r[:text_idx] + [joined] + r[text_idx + extra + 1:]
+        elif extra < 0:
+            r = r + [""] * (-extra)
+        fixed.append(r)
+    return pd.DataFrame(fixed, columns=header)
+
+
 def download_dataset(supabase, file_path: str) -> pd.DataFrame:
     file_bytes = supabase.storage.from_("datasets").download(file_path)
 
     if file_path.lower().endswith(".csv"):
-        # CSV dari Excel/Windows sering bukan UTF-8. Coba beberapa encoding;
-        # utf-8-sig menangani BOM, cp1252 menangani file ANSI Windows.
-        df = None
-        last_error = None
-        for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
-            try:
-                df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc, sep=None, engine="python")
-                break
-            except (UnicodeDecodeError, UnicodeError) as e:
-                last_error = e
-        if df is None:
-            raise ValueError(f"Encoding file CSV tidak dikenali: {last_error}")
+        df = _read_csv_bytes(file_bytes)
     else:
         df = pd.read_excel(io.BytesIO(file_bytes))
 
